@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+.env
+dist/
+coverage/
+.vscode/
+.idea/
+
+# opensrc - source code for packages
+opensrc/
