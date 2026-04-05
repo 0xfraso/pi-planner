@@ -93,23 +93,222 @@ function getBlockedBashReason(reason: string): string {
 	return `Plan mode: ${reason}. ${getPlanModeExitHint()}`;
 }
 
-function isWhitelistedCommand(command: string, whitelistedCommands: string[]): boolean {
-	const trimmed = command.trim().replace(/\\\n\s*/g, "").replace(/\n\s*/g, " ");
-	const UNSAFE_SHELL_CHARS = /[|;&`\n]/;
-	const REDIRECT_PATTERN = />{1,2}/;
+type CommandValidationResult = {
+	ok: boolean;
+	reason?: string;
+};
 
-	if (UNSAFE_SHELL_CHARS.test(trimmed)) return false;
-	if (REDIRECT_PATTERN.test(trimmed)) return false;
+/**
+ * Scans command for unsupported shell constructs.
+ * Returns a reason string if something unsafe/unparseable is found, null otherwise.
+ */
+function findUnsafeShellSyntax(command: string): string | null {
+	const SUPPORTED_SEPARATORS = ["&&", "||", ";"];
+	let i = 0;
+	let inSingleQuote = false;
+	let inDoubleQuote = false;
+	let escaped = false;
 
-	// Check against whitelisted commands
+	while (i < command.length) {
+		const ch = command[i]!;
+
+		if (escaped) {
+			escaped = false;
+			i++;
+			continue;
+		}
+
+		if (ch === "\\" && !inSingleQuote) {
+			escaped = true;
+			i++;
+			continue;
+		}
+
+		if (ch === "'" && !inDoubleQuote) {
+			inSingleQuote = !inSingleQuote;
+			i++;
+			continue;
+		}
+
+		if (ch === '"' && !inSingleQuote) {
+			inDoubleQuote = !inDoubleQuote;
+			i++;
+			continue;
+		}
+
+		if (inSingleQuote || inDoubleQuote) {
+			i++;
+			continue;
+		}
+
+		// Check for && and || before checking for single | to avoid false positives
+		const ahead2 = command.slice(i, i + 2);
+		if (ahead2 === "||" || ahead2 === "&&") { i += 2; continue; }
+
+		// Unsupported constructs — all reason strings
+		if (ch === "|") return "pipe operator is not allowed";
+		if (ch === "`") return "command substitution (backticks) is not allowed";
+		if (ch === "$" && command[i + 1] === "(") return "command substitution ($(...)) is not allowed";
+		if (ch === "(") return "subshell grouping is not allowed";
+		if (ch === ")") return "unmatched closing parenthesis";
+		if (ch === "<") {
+			// Redirect stdin or process substitution
+			if (command[i + 1] === "(") return "process substitution is not allowed";
+			return "input redirect is not allowed";
+		}
+		if (ch === ">") return "output redirect is not allowed";
+		// Background operator (single &) — reject unless it's &&
+		if (ch === "&") {
+			// Check if it's part of &&
+			const ahead = command.slice(i, i + 2);
+			if (ahead !== "&&") return "background operator (&) is not allowed";
+		}
+		if (ch === "\n") return "multiline commands are not allowed";
+
+		i++;
+	}
+
+	if (inSingleQuote) return "unclosed single quote";
+	if (inDoubleQuote) return "unclosed double quote";
+
+	return null;
+}
+
+/**
+ * Split a command by &&, ||, or ; (outside of quotes).
+ * Returns null if the command contains unsupported shell syntax.
+ */
+function splitCommandChain(command: string): string[] | null {
+	const SUPPORTED_SEPARATORS = ["&&", "||", ";"];
+	const segments: string[] = [];
+	let current = "";
+	let i = 0;
+	let inSingleQuote = false;
+	let inDoubleQuote = false;
+	let escaped = false;
+
+	while (i < command.length) {
+		const ch = command[i]!;
+
+		if (escaped) {
+			current += ch;
+			escaped = false;
+			i++;
+			continue;
+		}
+
+		if (ch === "\\" && !inSingleQuote) {
+			current += ch;
+			escaped = true;
+			i++;
+			continue;
+		}
+
+		if (ch === "'" && !inDoubleQuote) {
+			inSingleQuote = !inSingleQuote;
+			current += ch;
+			i++;
+			continue;
+		}
+
+		if (ch === '"' && !inSingleQuote) {
+			inDoubleQuote = !inDoubleQuote;
+			current += ch;
+			i++;
+			continue;
+		}
+
+		if (inSingleQuote || inDoubleQuote) {
+			current += ch;
+			i++;
+			continue;
+		}
+
+		// Check for supported separators
+		const ahead2 = command.slice(i, i + 2);
+		if (SUPPORTED_SEPARATORS.includes(ahead2)) {
+			segments.push(current.trim());
+			current = "";
+			i += 2;
+			continue;
+		}
+
+		if (ch === ";") {
+			segments.push(current.trim());
+			current = "";
+			i++;
+			continue;
+		}
+
+		current += ch;
+		i++;
+	}
+
+	segments.push(current.trim());
+	return segments;
+}
+
+const MUTATING_GIT_PATTERN = /^\s*git\s+(commit|push|pull|merge|rebase|reset|cherry-pick|branch\s+-[dD]|tag\s+-d)\b/;
+
+function isWhitelistedSegment(segment: string, whitelistedCommands: string[]): boolean {
+	const trimmed = segment.trim();
+	if (!trimmed) return false;
+
 	return whitelistedCommands.some((cmd) => {
 		if (cmd === "git") {
 			return /^\s*git\s+(status|log|diff|show|branch)\b/.test(trimmed);
 		}
-		if (cmd === "echo") return /^\s*echo\s/.test(trimmed);
-		if (cmd === "printf") return /^\s*printf\s/.test(trimmed);
-		return new RegExp(`^\\s*${cmd}\\s`).test(trimmed);
+		if (cmd === "echo") return /^\s*echo(?:\s|$)/.test(trimmed);
+		if (cmd === "printf") return /^\s*printf(?:\s|$)/.test(trimmed);
+		// Allow command with trailing space, newline, or end of string
+		return new RegExp(`^\\s*${cmd}(?:\\s|$)`).test(trimmed);
 	});
+}
+
+function isMutatingGitCommand(segment: string): boolean {
+	return MUTATING_GIT_PATTERN.test(segment.trim());
+}
+
+/**
+ * Validate a bash command for plan mode.
+ * - Rejects unsupported shell constructs (pipes, redirects, subshells, etc.)
+ * - Allows &&, ||, and ; between individually safe commands
+ * - Each segment must pass the whitelist check
+ * - Each segment must not be a mutating git command
+ */
+function validateSafeCommand(command: string, whitelistedCommands: string[]): CommandValidationResult {
+	// First: reject any unsafe shell syntax outright
+	const unsafe = findUnsafeShellSyntax(command);
+	if (unsafe) {
+		return { ok: false, reason: unsafe };
+	}
+
+	// Split into segments by &&, ||, ;
+	const segments = splitCommandChain(command);
+	if (!segments) {
+		// Should not happen since findUnsafeShellSyntax passed, but guard anyway
+		return { ok: false, reason: "unsupported command syntax" };
+	}
+
+	// Validate each segment
+	for (let i = 0; i < segments.length; i++) {
+		const segment = segments[i]!;
+
+		if (!segment) {
+			// Reject empty segments — they indicate malformed input
+			return { ok: false, reason: "empty command segment is not allowed" };
+		}
+
+		if (isMutatingGitCommand(segment)) {
+			return { ok: false, reason: `mutating git commands are not allowed: ${segment.trim()}` };
+		}
+
+		if (!isWhitelistedSegment(segment, whitelistedCommands)) {
+			return { ok: false, reason: `command not allowed in plan mode: ${segment.trim()}` };
+		}
+	}
+
+	return { ok: true };
 }
 
 function isPlannerThinkingLevel(value: unknown): value is PlannerThinkingLevel {
@@ -657,30 +856,12 @@ export default function plannerExtension(pi: ExtensionAPI): void {
 
 		if (event.toolName === "bash") {
 			const command = (event.input as { command?: string } | undefined)?.command ?? "";
+			const result = validateSafeCommand(command, currentSettings.whitelistedCommands);
 
-			// Check mutating git commands
-			const mutatingGitPattern = /^\s*git\s+(commit|push|pull|merge|rebase|reset|cherry-pick|branch\s+-[dD]|tag\s+-d)\b/;
-			if (mutatingGitPattern.test(command)) {
+			if (!result.ok) {
 				return {
 					block: true,
-					reason: getBlockedBashReason("mutating git commands are not allowed"),
-				};
-			}
-
-			const UNSAFE_SHELL_CHARS = /[|;&`\n]/;
-			const REDIRECT_PATTERN = />{1,2}/;
-
-			if (REDIRECT_PATTERN.test(command)) {
-				return {
-					block: true,
-					reason: getBlockedBashReason("file redirects are not allowed"),
-				};
-			}
-
-			if (!isWhitelistedCommand(command, currentSettings.whitelistedCommands)) {
-				return {
-					block: true,
-					reason: getBlockedBashReason("only whitelisted read-only bash commands are allowed"),
+					reason: getBlockedBashReason(result.reason ?? "unsafe command"),
 				};
 			}
 		}
