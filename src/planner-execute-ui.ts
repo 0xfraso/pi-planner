@@ -1,8 +1,15 @@
 import type { ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import { askSelectOrFreeText, normalizeText } from "./select-or-free-text-ui";
 
 interface ExecuteSelectionResult {
 	confirmed: boolean;
+}
+
+export interface ExecuteClarificationResult {
+	cancelled: boolean;
+	selectedOption?: string;
+	freeText?: string;
 }
 
 export async function askExecuteConfirmation(
@@ -12,7 +19,7 @@ export async function askExecuteConfirmation(
 	const options = ["No", "Yes"];
 
 	const result = await ui.custom<ExecuteSelectionResult>((tui, theme, _keybindings, done) => {
-		let cursorIndex = 1; // Default to "Yes" (index 1)
+		let cursorIndex = 1;
 		let cachedRenderedLines: string[] | undefined;
 		let cachedRenderedWidth: number | undefined;
 
@@ -59,23 +66,20 @@ export async function askExecuteConfirmation(
 				return;
 			}
 
-			// Navigation: ↑, k, ←, h - move up/left
 			if (matchesKey(data, Key.up) || data === "k" || matchesKey(data, Key.left) || data === "h") {
-				cursorIndex = 0; // "No"
+				cursorIndex = 0;
 				requestUiRerender();
 				return;
 			}
 
-			// Navigation: ↓, j, →, l - move down/right
 			if (matchesKey(data, Key.down) || data === "j" || matchesKey(data, Key.right) || data === "l") {
-				cursorIndex = 1; // "Yes"
+				cursorIndex = 1;
 				requestUiRerender();
 				return;
 			}
 
 			if (matchesKey(data, Key.enter)) {
-				done({ confirmed: cursorIndex === 1 }); // true if "Yes" selected
-				return;
+				done({ confirmed: cursorIndex === 1 });
 			}
 		};
 
@@ -90,4 +94,22 @@ export async function askExecuteConfirmation(
 	}, { overlay: false });
 
 	return result;
+}
+
+export async function askExecuteClarification(
+	ui: ExtensionUIContext,
+	question: string,
+	options: string[],
+): Promise<ExecuteClarificationResult> {
+	const result = await askSelectOrFreeText(ui, {
+		question,
+		options: options.map((label) => ({ label })),
+		allowFreeText: true,
+	});
+
+	return {
+		cancelled: result.cancelled,
+		selectedOption: result.selectedIndex == null ? undefined : options[result.selectedIndex],
+		freeText: normalizeText(result.freeText ?? ""),
+	};
 }

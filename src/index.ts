@@ -2,50 +2,9 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Key } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { askPlannerQuestions } from "./planner-ask-ui";
-import { askExecuteConfirmation } from "./planner-execute-ui";
+import { askExecuteClarification, askExecuteConfirmation } from "./planner-execute-ui";
+import { loadPlannerSettings, getSettings, setSettings, type PlannerSettings, type PlannerThinkingLevel } from "./planner-settings";
 
-const SAFE_COMMAND_PATTERNS: RegExp[] = [
-	/^\s*cat\s/,
-	/^\s*ls\s/,
-	/^\s*grep\s/,
-	/^\s*rg\s/,
-	/^\s*find\s/,
-	/^\s*head\s/,
-	/^\s*tail\s/,
-	/^\s*wc\s/,
-	/^\s*pwd\s*$/,
-	/^\s*echo\s/,
-	/^\s*printf\s/,
-	/^\s*git\s+(status|log|diff|show|branch)\b/,
-	/^\s*file\s/,
-	/^\s*stat\s/,
-	/^\s*du\s/,
-	/^\s*df\s/,
-	/^\s*which\s/,
-	/^\s*type\s/,
-	/^\s*env\s*$/,
-	/^\s*printenv\s*$/,
-	/^\s*uname\s*$/,
-	/^\s*whoami\s*$/,
-	/^\s*date\s*$/,
-];
-
-const MUTATING_GIT_COMMANDS: RegExp[] = [
-	/^\s*git\s+commit\b/,
-	/^\s*git\s+push\b/,
-	/^\s*git\s+pull\b/,
-	/^\s*git\s+merge\b/,
-	/^\s*git\s+rebase\b/,
-	/^\s*git\s+reset\b/,
-	/^\s*git\s+cherry-pick\b/,
-	/^\s*git\s+branch\s+-D\b/,
-	/^\s*git\s+branch\s+-d\b/,
-	/^\s*git\s+tag\s+-d\b/,
-];
-
-const UNSAFE_SHELL_CHARS = /[|;&`\n]/;
-const REDIRECT_PATTERN = />{1,2}/;
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "planner_ask", "planner_execute"];
 const PlannerAskOptionParams = Type.Object({
 	label: Type.String({ description: "Display label" }),
 });
@@ -73,42 +32,280 @@ const PlannerAskParams = Type.Object({
 });
 const PlanExecuteParams = Type.Object({});
 
-type PlanModeState = {
-	active: boolean;
+type ModelRef = {
+	provider: string;
+	modelId: string;
 };
 
-function isWhitelisted(command: string): boolean {
+type PlanModeState = {
+	active: boolean;
+	previousModel: ModelRef | null;
+	previousThinkingLevel: PlannerThinkingLevel | null;
+	sessionPlanModel: ModelRef | null;
+	sessionPlanThinkingLevel: PlannerThinkingLevel | null;
+};
+
+function formatToolList(toolNames: string[]): string {
+	if (toolNames.length === 0) return "none";
+	if (toolNames.length === 1) return toolNames[0];
+	if (toolNames.length === 2) return `${toolNames[0]} and ${toolNames[1]}`;
+	return `${toolNames.slice(0, -1).join(", ")}, and ${toolNames[toolNames.length - 1]}`;
+}
+
+function getNonBashBlockedTools(settings: PlannerSettings): string[] {
+	return settings.blockedTools.filter((tool) => tool !== "bash");
+}
+
+function getPlanModeRestrictionSummary(settings: PlannerSettings): string {
+	const parts: string[] = [];
+	const nonBashBlockedTools = getNonBashBlockedTools(settings);
+
+	if (nonBashBlockedTools.length > 0) {
+		parts.push(`Blocked tools: ${formatToolList(nonBashBlockedTools)}.`);
+	}
+
+	if (settings.blockedTools.includes("bash")) {
+		parts.push("The bash tool is blocked.");
+	} else {
+		parts.push("Bash is limited to whitelisted read-only commands.");
+	}
+
+	return parts.join(" ");
+}
+
+function getPlanModeEnabledMessage(settings: PlannerSettings): string {
+	return `Plan mode enabled. ${getPlanModeRestrictionSummary(settings)}`;
+}
+
+function getPlanModeStatusMessage(): string {
+	return "[PLAN MODE ACTIVE]";
+}
+
+function getPlanModeExitHint(): string {
+	return "Use planner_execute to restore full tool access.";
+}
+
+function getBlockedToolReason(toolName: string): string {
+	return `Plan mode is active. The ${toolName} tool is blocked. ${getPlanModeExitHint()}`;
+}
+
+function getBlockedBashReason(reason: string): string {
+	return `Plan mode: ${reason}. ${getPlanModeExitHint()}`;
+}
+
+function isWhitelistedCommand(command: string, whitelistedCommands: string[]): boolean {
 	const trimmed = command.trim().replace(/\\\n\s*/g, "").replace(/\n\s*/g, " ");
+	const UNSAFE_SHELL_CHARS = /[|;&`\n]/;
+	const REDIRECT_PATTERN = />{1,2}/;
+
 	if (UNSAFE_SHELL_CHARS.test(trimmed)) return false;
 	if (REDIRECT_PATTERN.test(trimmed)) return false;
-	return SAFE_COMMAND_PATTERNS.some((pattern) => pattern.test(trimmed));
+
+	// Check against whitelisted commands
+	return whitelistedCommands.some((cmd) => {
+		if (cmd === "git") {
+			return /^\s*git\s+(status|log|diff|show|branch)\b/.test(trimmed);
+		}
+		if (cmd === "echo") return /^\s*echo\s/.test(trimmed);
+		if (cmd === "printf") return /^\s*printf\s/.test(trimmed);
+		return new RegExp(`^\\s*${cmd}\\s`).test(trimmed);
+	});
+}
+
+function isPlannerThinkingLevel(value: unknown): value is PlannerThinkingLevel {
+	return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+}
+
+function toModelRef(value: unknown): ModelRef | null {
+	if (!value || typeof value !== "object") return null;
+	const input = value as { provider?: unknown; modelId?: unknown };
+	if (typeof input.provider !== "string" || typeof input.modelId !== "string") return null;
+	return { provider: input.provider, modelId: input.modelId };
 }
 
 function getLatestPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
 	const entries = ctx.sessionManager.getEntries();
 	const stateEntry = entries
 		.filter((entry) => entry.type === "custom" && entry.customType === "plan-mode")
-		.pop() as { data?: { active?: boolean } } | undefined;
+		.pop() as {
+			data?: {
+				active?: boolean;
+				previousModel?: unknown;
+				previousThinkingLevel?: unknown;
+				sessionPlanModel?: unknown;
+				sessionPlanThinkingLevel?: unknown;
+			};
+		} | undefined;
 
 	if (typeof stateEntry?.data?.active !== "boolean") {
 		return undefined;
 	}
 
-	return { active: stateEntry.data.active };
+	return {
+		active: stateEntry.data.active,
+		previousModel: toModelRef(stateEntry.data.previousModel),
+		previousThinkingLevel: isPlannerThinkingLevel(stateEntry.data.previousThinkingLevel) ? stateEntry.data.previousThinkingLevel : null,
+		sessionPlanModel: toModelRef(stateEntry.data.sessionPlanModel),
+		sessionPlanThinkingLevel: isPlannerThinkingLevel(stateEntry.data.sessionPlanThinkingLevel) ? stateEntry.data.sessionPlanThinkingLevel : null,
+	};
 }
 
-export default function planModeExtension(pi: ExtensionAPI): void {
-	let planModeEnabled = true;
+function sameModelRef(a: ModelRef | null, b: ModelRef | null): boolean {
+	if (a === null || b === null) return a === b;
+	return a.provider === b.provider && a.modelId === b.modelId;
+}
+
+function getCurrentModelRef(ctx: ExtensionContext): ModelRef | null {
+	if (!ctx.model) return null;
+	return { provider: ctx.model.provider, modelId: ctx.model.id };
+}
+
+function resolveConfiguredPlanModel(settings: PlannerSettings): ModelRef | null {
+	if (!settings.planModelProvider || !settings.planModelId) return null;
+	return {
+		provider: settings.planModelProvider,
+		modelId: settings.planModelId,
+	};
+}
+
+function buildSystemPromptAdditions(settings: PlannerSettings): string {
+	if (settings.systemPrompt !== null) {
+		return settings.systemPrompt;
+	}
+
+	let additions = "";
+	const nonBashBlockedTools = getNonBashBlockedTools(settings);
+
+	if (settings.showPlanModePrefix) {
+		additions += `[PLAN MODE ACTIVE]\n`;
+	}
+
+	additions += `- You are in planning mode.\n`;
+	additions += `- Focus on understanding the task, exploring the codebase, and planning before implementation.\n`;
+	additions += `- Ask the user clarifying questions with planner_ask whenever structured interactive input is useful.\n`;
+	additions += `- You may also ask normal conversational questions when that is simpler.\n`;
+
+	if (nonBashBlockedTools.length > 0) {
+		additions += `- Blocked tools in this mode: ${formatToolList(nonBashBlockedTools)}.\n`;
+	} else {
+		additions += `- No non-bash tools are blocked via planner.blockedTools.\n`;
+	}
+
+	if (settings.blockedTools.includes("bash")) {
+		additions += `- The bash tool is blocked in this mode.\n`;
+	} else {
+		additions += `- If you use bash, only whitelisted read-only commands are allowed.\n`;
+	}
+
+	additions += `- Respect the configured tool restrictions instead of assuming a fixed read-only tool set.\n`;
+	additions += `- When you have enough information and are ready to implement, make sure to call planner_execute to disable plan mode.\n`;
+
+	if (settings.systemPromptAdditions) {
+		additions += `\n${settings.systemPromptAdditions}\n`;
+	}
+
+	return additions;
+}
+
+
+export default function plannerExtension(pi: ExtensionAPI): void {
+	// Load settings on extension initialization
+	const settings = loadPlannerSettings();
+	setSettings(settings);
+
+	let planModeEnabled = settings.defaultMode === "plan";
+	let previousModel: ModelRef | null = null;
+	let previousThinkingLevel: PlannerThinkingLevel | null = null;
+	let sessionPlanModel: ModelRef | null = null;
+	let sessionPlanThinkingLevel: PlannerThinkingLevel | null = null;
+	let currentPlanThinkingLevel: PlannerThinkingLevel | null = null;
+	let suppressPlanModelCapture = false;
 
 	function getAllToolNames(): string[] {
 		return pi.getAllTools().map((tool) => tool.name);
 	}
 
+	function resolveEffectivePlanModel(settings: PlannerSettings): ModelRef | null {
+		return sessionPlanModel ?? resolveConfiguredPlanModel(settings);
+	}
+
+	function resolveEffectivePlanThinking(settings: PlannerSettings): PlannerThinkingLevel | null {
+		return sessionPlanThinkingLevel ?? settings.planThinkingLevel;
+	}
+
+	async function applyPlanModeModelAndThinking(ctx: ExtensionContext): Promise<void> {
+		const currentSettings = getSettings();
+		const targetModel = resolveEffectivePlanModel(currentSettings);
+		const currentModel = getCurrentModelRef(ctx);
+
+		if (targetModel && !sameModelRef(targetModel, currentModel)) {
+			const model = ctx.modelRegistry.find(targetModel.provider, targetModel.modelId);
+			if (!model) {
+				ctx.ui.notify(`Planner plan model not found: ${targetModel.provider}/${targetModel.modelId}`, "warning");
+			} else {
+				suppressPlanModelCapture = true;
+				try {
+					const success = await pi.setModel(model);
+					if (!success) {
+						ctx.ui.notify(`Planner plan model is unavailable: ${targetModel.provider}/${targetModel.modelId}`, "warning");
+					}
+				} finally {
+					suppressPlanModelCapture = false;
+				}
+			}
+		}
+
+		const targetThinking = resolveEffectivePlanThinking(currentSettings);
+		if (targetThinking && pi.getThinkingLevel() !== targetThinking) {
+			pi.setThinkingLevel(targetThinking);
+		}
+		currentPlanThinkingLevel = pi.getThinkingLevel();
+	}
+
+	async function restorePreviousModelAndThinking(ctx: ExtensionContext): Promise<void> {
+		if (previousModel && !sameModelRef(previousModel, getCurrentModelRef(ctx))) {
+			const model = ctx.modelRegistry.find(previousModel.provider, previousModel.modelId);
+			if (!model) {
+				ctx.ui.notify(`Planner could not restore previous model: ${previousModel.provider}/${previousModel.modelId}`, "warning");
+			} else {
+				suppressPlanModelCapture = true;
+				try {
+					const success = await pi.setModel(model);
+					if (!success) {
+						ctx.ui.notify(`Planner could not restore previous model: ${previousModel.provider}/${previousModel.modelId}`, "warning");
+					}
+				} finally {
+					suppressPlanModelCapture = false;
+				}
+			}
+		}
+
+		if (previousThinkingLevel !== null && pi.getThinkingLevel() !== previousThinkingLevel) {
+			pi.setThinkingLevel(previousThinkingLevel);
+		}
+		currentPlanThinkingLevel = null;
+	}
+
+	function syncPlanThinkingOverride(): void {
+		if (!planModeEnabled || !getSettings().enabled) return;
+		const currentThinkingLevel = pi.getThinkingLevel();
+		if (currentPlanThinkingLevel === currentThinkingLevel) return;
+		sessionPlanThinkingLevel = currentThinkingLevel;
+		currentPlanThinkingLevel = currentThinkingLevel;
+		persistState();
+	}
+
 	function applyTools(): void {
-		const available = new Set(getAllToolNames());
+		const currentSettings = getSettings();
+
+		if (!currentSettings.enabled) {
+			pi.setActiveTools(getAllToolNames());
+			return;
+		}
+
 		if (planModeEnabled) {
-			const tools = PLAN_MODE_TOOLS.filter((toolName) => available.has(toolName));
-			pi.setActiveTools(tools);
+			const allowedTools = getAllToolNames().filter((tool) => !currentSettings.blockedTools.includes(tool));
+			pi.setActiveTools(allowedTools);
 			return;
 		}
 
@@ -116,25 +313,52 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		if (planModeEnabled) {
-			// ctx.ui.setStatus("planner", ctx.ui.theme.fg("warning", "planning"));
-			ctx.ui.setWidget("planner", [ctx.ui.theme.fg("warning", "Plan mode active: read-only until planner_execute or /planner")]);
+		const currentSettings = getSettings();
+
+		if (planModeEnabled && currentSettings.enabled) {
+			ctx.ui.setWidget("planner", [
+				ctx.ui.theme.fg("warning", getPlanModeStatusMessage()),
+			]);
 			return;
 		}
 
-		// ctx.ui.setStatus("planner", undefined);
 		ctx.ui.setWidget("planner", undefined);
 	}
 
 	function persistState(): void {
 		pi.appendEntry("plan-mode", {
 			active: planModeEnabled,
+			previousModel,
+			previousThinkingLevel,
+			sessionPlanModel,
+			sessionPlanThinkingLevel,
 			timestamp: Date.now(),
 		});
 	}
 
-	function setPlanMode(ctx: ExtensionContext, enabled: boolean, notifyMessage?: string): void {
-		planModeEnabled = enabled;
+	async function setPlanMode(ctx: ExtensionContext, enabled: boolean, notifyMessage?: string): Promise<void> {
+		if (enabled === planModeEnabled) {
+			applyTools();
+			updateStatus(ctx);
+			persistState();
+			if (notifyMessage) {
+				ctx.ui.notify(notifyMessage, "info");
+			}
+			return;
+		}
+
+		if (enabled) {
+			previousModel = getCurrentModelRef(ctx);
+			previousThinkingLevel = pi.getThinkingLevel();
+			planModeEnabled = true;
+			await applyPlanModeModelAndThinking(ctx);
+		} else {
+			await restorePreviousModelAndThinking(ctx);
+			planModeEnabled = false;
+			previousModel = null;
+			previousThinkingLevel = null;
+		}
+
 		applyTools();
 		updateStatus(ctx);
 		persistState();
@@ -144,9 +368,15 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("planner", {
-		description: "Toggle plan mode. In plan mode, only read-only tools are available.",
+		description: "Toggle plan mode. In plan mode, configured tool restrictions are applied.",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			const normalized = (args ?? "").trim().toLowerCase();
+			const currentSettings = getSettings();
+
+			if (!currentSettings.enabled) {
+				ctx.ui.notify("Planner extension is disabled. Set planner.enabled to true in settings.", "info");
+				return;
+			}
 
 			if (normalized === "status") {
 				ctx.ui.notify(`Plan mode: ${planModeEnabled ? "on" : "off"}`, "info");
@@ -154,19 +384,19 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			}
 
 			if (normalized === "on") {
-				setPlanMode(ctx, true, "Plan mode enabled. Write/edit tools blocked.");
+				await setPlanMode(ctx, true, getPlanModeEnabledMessage(currentSettings));
 				return;
 			}
 
 			if (normalized === "off" || normalized === "execute" || normalized === "implement") {
-				setPlanMode(ctx, false, "Plan mode disabled. Full tool access restored.");
+				await setPlanMode(ctx, false, "Plan mode disabled. Full tool access restored.");
 				return;
 			}
 
-			setPlanMode(
+			await setPlanMode(
 				ctx,
 				!planModeEnabled,
-				planModeEnabled ? "Plan mode disabled. Full tool access restored." : "Plan mode enabled. Write/edit tools blocked.",
+				planModeEnabled ? "Plan mode disabled. Full tool access restored." : getPlanModeEnabledMessage(currentSettings),
 			);
 		},
 	});
@@ -174,6 +404,13 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("planner_execute", {
 		description: "Exit plan mode after confirming planning is complete. Asks for clarifications if user declines.",
 		handler: async (_args: string, ctx: ExtensionContext) => {
+			const currentSettings = getSettings();
+
+			if (!currentSettings.enabled) {
+				ctx.ui.notify("Planner extension is disabled.", "info");
+				return;
+			}
+
 			if (!planModeEnabled) {
 				ctx.ui.notify("Plan mode is already off. Full tool access is available.", "info");
 				return;
@@ -187,38 +424,23 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			const confirmed = await askExecuteConfirmation(ctx.ui, "Planning looks complete. Disable plan mode?");
 
 			if (!confirmed.confirmed) {
-				const clarificationOptions = [
-					"Unclear requirements or scope",
-					"Missing technical details",
-					"Edge cases to consider",
-					"Dependencies or prerequisites",
-					"Other concerns"
-				];
-
-				const clarificationChoice = await ctx.ui.select(
+				const clarification = await askExecuteClarification(
+					ctx.ui,
 					"What would you like me to clarify?",
-					clarificationOptions,
-					{ timeout: 60000 }
+					currentSettings.clarificationOptions,
 				);
 
-				if (clarificationChoice === undefined) {
+				const clarificationText = clarification.selectedOption ?? clarification.freeText;
+				if (clarification.cancelled || !clarificationText) {
 					ctx.ui.notify("Plan mode remains on. Take your time to review the plan.", "info");
 					return;
 				}
 
-				const clarificationPrompts: Record<string, string> = {
-					"Unclear requirements or scope": "The user indicated that the requirements or scope are unclear. Please ask specific questions to clarify what's needed before proceeding.",
-					"Missing technical details": "The user indicated that technical implementation details are missing. Please explore the codebase more or ask about specific technical decisions.",
-					"Edge cases to consider": "The user indicated there are edge cases to consider. Please identify and address potential edge cases in the plan.",
-					"Dependencies or prerequisites": "The user indicated there are dependencies or prerequisites to clarify. Please identify what's needed before implementation.",
-					"Other concerns": "The user has other concerns about the plan. Please ask what specific issues they'd like addressed."
-				};
-
-				ctx.ui.notify(clarificationPrompts[clarificationChoice] || "Please ask what specific issues you'd like addressed.", "info");
+				ctx.ui.notify(`Please clarify: ${clarificationText}`, "info");
 				return;
 			}
 
-			setPlanMode(ctx, false, "Plan mode disabled. Full tool access restored.");
+			await setPlanMode(ctx, false, "Plan mode disabled. Full tool access restored.");
 		},
 	});
 
@@ -228,6 +450,15 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		description: "Ask the user one or more structured planning questions interactively.",
 		parameters: PlannerAskParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const currentSettings = getSettings();
+
+			if (!currentSettings.enabled) {
+				return {
+					content: [{ type: "text", text: "Planner extension is disabled." }],
+					details: { active: false, enabled: false },
+				};
+			}
+
 			if (!planModeEnabled) {
 				return {
 					content: [{ type: "text", text: "Plan mode is off. Ask the user directly in normal conversation instead." }],
@@ -259,13 +490,21 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-
 	pi.registerTool({
 		name: "planner_execute",
 		label: "Planner Execute",
 		description: "Exit plan mode after confirming that planning is complete.",
 		parameters: PlanExecuteParams,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const currentSettings = getSettings();
+
+			if (!currentSettings.enabled) {
+				return {
+					content: [{ type: "text", text: "Planner extension is disabled." }],
+					details: { active: false, enabled: false },
+				};
+			}
+
 			if (!planModeEnabled) {
 				return {
 					content: [{ type: "text", text: "Plan mode is already off. Full tool access is available." }],
@@ -284,49 +523,34 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			const confirmed = await askExecuteConfirmation(ctx.ui, "Planning looks complete. Disable plan mode?");
 
 			if (!confirmed.confirmed) {
-				const clarificationOptions = [
-					"Unclear requirements or scope",
-					"Missing technical details",
-					"Edge cases to consider",
-					"Dependencies or prerequisites",
-					"Other concerns"
-				];
-
-				const clarificationChoice = await ctx.ui.select(
+				const clarification = await askExecuteClarification(
+					ctx.ui,
 					"What would you like me to clarify?",
-					clarificationOptions,
-					{ timeout: 60000 }
+					currentSettings.clarificationOptions,
 				);
 
-				if (clarificationChoice === undefined) {
+				const clarificationText = clarification.selectedOption ?? clarification.freeText;
+				if (clarification.cancelled || !clarificationText) {
 					return {
 						content: [{ type: "text", text: "Plan mode remains on. Take your time to review the plan." }],
 						details: { active: true, confirmed: false, clarificationRequested: false },
 					};
 				}
 
-				const clarificationPrompts: Record<string, string> = {
-					"Unclear requirements or scope": "The user indicated that the requirements or scope are unclear. Please ask specific questions to clarify what's needed before proceeding.",
-					"Missing technical details": "The user indicated that technical implementation details are missing. Please explore the codebase more or ask about specific technical decisions.",
-					"Edge cases to consider": "The user indicated there are edge cases to consider. Please identify and address potential edge cases in the plan.",
-					"Dependencies or prerequisites": "The user indicated there are dependencies or prerequisites to clarify. Please identify what's needed before implementation.",
-					"Other concerns": "The user has other concerns about the plan. Please ask what specific issues they'd like addressed."
-				};
-
-				const clarificationPrompt = clarificationPrompts[clarificationChoice] || "The user wants clarifications. Please ask what specific issues they'd like addressed.";
-
 				return {
-					content: [{ type: "text", text: `Plan mode remains on.\n\n${clarificationPrompt}` }],
+					content: [{ type: "text", text: `Plan mode remains on.\n\nPlease clarify: ${clarificationText}` }],
 					details: {
 						active: true,
 						confirmed: false,
 						clarificationRequested: true,
-						clarificationTopic: clarificationChoice
+						clarificationTopic: clarificationText,
+						clarificationSelection: clarification.selectedOption,
+						clarificationFreeText: clarification.freeText,
 					},
 				};
 			}
 
-			setPlanMode(ctx, false, "Plan mode disabled. Full tool access restored.");
+			await setPlanMode(ctx, false, "Plan mode disabled. Full tool access restored.");
 			return {
 				content: [
 					{
@@ -342,10 +566,14 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	pi.registerShortcut(Key.ctrl("space"), {
 		description: "Toggle plan mode",
 		handler: async (ctx) => {
-			setPlanMode(
+			const currentSettings = getSettings();
+
+			if (!currentSettings.enabled) return;
+
+			await setPlanMode(
 				ctx,
 				!planModeEnabled,
-				planModeEnabled ? "Plan mode disabled. Full tool access restored." : "Plan mode enabled. Write/edit tools blocked.",
+				planModeEnabled ? "Plan mode disabled. Full tool access restored." : getPlanModeEnabledMessage(currentSettings),
 			);
 		},
 	});
@@ -354,24 +582,23 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		applyTools();
 		updateStatus(ctx);
 
-		if (!planModeEnabled) return;
+		const currentSettings = getSettings();
 
+		if (!currentSettings.enabled || !planModeEnabled) return;
+
+		syncPlanThinkingOverride();
+		const plannerPrompt = buildSystemPromptAdditions(currentSettings);
 		return {
-			systemPrompt:
-				`${event.systemPrompt}\n\n[PLAN MODE ACTIVE]\n` +
-				`- You are in planning mode.\n` +
-				`- Only read-only exploration is allowed.\n` +
-				`- Ask the user clarifying questions with planner_ask whenever structured interactive input is useful.\n` +
-				`- You may also ask normal conversational questions when that is simpler.\n` +
-				`- Use read, grep, find, ls, and safe bash commands to understand the codebase.\n` +
-				`- Do not attempt to edit files or run mutating shell commands.\n` +
-				`- When you have enough information and are ready to implement, make sure to call planner_execute to disable plan mode.\n`,
+			systemPrompt: currentSettings.systemPrompt !== null ? plannerPrompt : `${event.systemPrompt}\n\n${plannerPrompt}`,
 		};
 	});
 
-	// Prepend [PLAN MODE ACTIVE] to every user message when plan mode is on
-	pi.on("input", async (event, ctx) => {
-		if (!planModeEnabled) return;
+	// Prepend [PLAN MODE ACTIVE] to user messages only when configured and plan mode is on
+	pi.on("input", async (event) => {
+		const currentSettings = getSettings();
+
+		if (!currentSettings.enabled || !planModeEnabled) return;
+		if (!currentSettings.showPlanModePrefix) return;
 		if (event.source === "extension") return;
 
 		return {
@@ -381,48 +608,79 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		const settings = loadPlannerSettings(ctx.cwd);
+		setSettings(settings);
+
 		const restored = getLatestPlanModeState(ctx);
-		planModeEnabled = restored?.active ?? true;
+		planModeEnabled = restored?.active ?? settings.defaultMode === "plan";
+		previousModel = restored?.previousModel ?? null;
+		previousThinkingLevel = restored?.previousThinkingLevel ?? null;
+		sessionPlanModel = restored?.sessionPlanModel ?? null;
+		sessionPlanThinkingLevel = restored?.sessionPlanThinkingLevel ?? null;
+		currentPlanThinkingLevel = planModeEnabled ? pi.getThinkingLevel() : null;
+		if (settings.enabled && planModeEnabled && !restored) {
+			previousModel = getCurrentModelRef(ctx);
+			previousThinkingLevel = pi.getThinkingLevel();
+			await applyPlanModeModelAndThinking(ctx);
+		}
+
 		applyTools();
 		updateStatus(ctx);
+
 		if (restored) {
 			ctx.ui.notify(`Plan mode restored: ${planModeEnabled ? "on" : "off"}.`, "info");
-		} else {
+		} else if (settings.enabled) {
 			persistState();
 		}
 	});
 
-	pi.on("tool_call", async (event) => {
-		if (!planModeEnabled) return;
+	pi.on("model_select", async (event) => {
+		if (!getSettings().enabled || !planModeEnabled || suppressPlanModelCapture) return;
+		if (event.source === "restore") return;
 
-		if (event.toolName === "write" || event.toolName === "edit") {
+		sessionPlanModel = { provider: event.model.provider, modelId: event.model.id };
+		persistState();
+	});
+
+	pi.on("tool_call", async (event) => {
+		const currentSettings = getSettings();
+
+		if (!currentSettings.enabled || !planModeEnabled) return;
+
+		// Block configured tools
+		if (currentSettings.blockedTools.includes(event.toolName)) {
 			return {
 				block: true,
-				reason: "Plan mode is active. Use planner_execute or /planner to enable write/edit tools.",
+				reason: getBlockedToolReason(event.toolName),
 			};
 		}
 
 		if (event.toolName === "bash") {
 			const command = (event.input as { command?: string } | undefined)?.command ?? "";
 
-			if (MUTATING_GIT_COMMANDS.some((pattern) => pattern.test(command))) {
+			// Check mutating git commands
+			const mutatingGitPattern = /^\s*git\s+(commit|push|pull|merge|rebase|reset|cherry-pick|branch\s+-[dD]|tag\s+-d)\b/;
+			if (mutatingGitPattern.test(command)) {
 				return {
 					block: true,
-					reason: "Plan mode: mutating git commands are not allowed.",
+					reason: getBlockedBashReason("mutating git commands are not allowed"),
 				};
 			}
+
+			const UNSAFE_SHELL_CHARS = /[|;&`\n]/;
+			const REDIRECT_PATTERN = />{1,2}/;
 
 			if (REDIRECT_PATTERN.test(command)) {
 				return {
 					block: true,
-					reason: "Plan mode: file redirects are not allowed.",
+					reason: getBlockedBashReason("file redirects are not allowed"),
 				};
 			}
 
-			if (!isWhitelisted(command)) {
+			if (!isWhitelistedCommand(command, currentSettings.whitelistedCommands)) {
 				return {
 					block: true,
-					reason: "Plan mode: only whitelisted read-only bash commands are allowed.",
+					reason: getBlockedBashReason("only whitelisted read-only bash commands are allowed"),
 				};
 			}
 		}
