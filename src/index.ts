@@ -640,6 +640,11 @@ export default function plannerExtension(pi: ExtensionAPI): void {
 			}
 
 			await setPlanMode(ctx, false, "Plan mode disabled. Full tool access restored.");
+			// Trigger agent to start implementation (command mode: user confirmed)
+			pi.sendMessage(
+				{ customType: "planner-execute", content: "Plan mode disabled. Begin implementation.", display: true },
+				{ triggerTurn: true },
+			);
 		},
 	});
 

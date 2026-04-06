@@ -8,7 +8,7 @@ A plan mode extension for pi that applies configurable tool restrictions, helpin
 - `/planner on` - Enable plan mode
 - `/planner off` - Disable plan mode
 - `/planner status` - Check current plan mode status
-- `/planner_execute` - Exit plan mode with confirmation dialog
+- `/planner_execute` - Exit plan mode with confirmation dialog and resume implementation
 - `Ctrl+Space` - Toggle plan mode
 
 ## Settings
@@ -59,4 +59,4 @@ If `planModelProvider`, `planModelId`, or `planThinkingLevel` are not set, plan 
 ## Tools
 
 - `planner_ask` - Ask structured questions to the user
-- `planner_execute` - Exit plan mode (for LLM to call)
+- `planner_execute` - Exit plan mode and resume implementation (for LLM to call)
