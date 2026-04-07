@@ -8,7 +8,7 @@ export type PlannerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high"
 
 export interface PlannerSettings {
 	enabled: boolean;
-	defaultMode: "plan" | "implement";
+	defaultOn: boolean;
 	showPlanModePrefix: boolean;
 	whitelistedCommands: string[];
 	blockedTools: string[];
@@ -22,7 +22,7 @@ export interface PlannerSettings {
 
 const DEFAULT_SETTINGS: PlannerSettings = {
 	enabled: true,
-	defaultMode: "plan",
+	defaultOn: false,
 	showPlanModePrefix: true,
 	whitelistedCommands: [
 		"cat",

@@ -19,7 +19,7 @@ Configure the planner extension in `~/.pi/agent/settings.json` or `.pi/settings.
 {
   "planner": {
     "enabled": true,
-    "defaultMode": "plan",
+    "defaultOn": false,
     "showPlanModePrefix": true,
     "whitelistedCommands": ["cat", "ls", "grep", "rg", "find", "head", "tail", "wc", "pwd", "echo", "printf", "git", "file", "stat", "du", "df", "which", "type", "env", "printenv", "uname", "whoami", "date"],
     "blockedTools": ["write", "edit"],
@@ -43,7 +43,7 @@ Configure the planner extension in `~/.pi/agent/settings.json` or `.pi/settings.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable/disable the planner extension |
-| `defaultMode` | string | `"plan"` | Default mode on startup: `"plan"` or `"implement"` |
+| `defaultOn` | boolean | `false` | Default plan mode state on startup (`true` = enabled) |
 | `showPlanModePrefix` | boolean | `true` | Prepend `[PLAN MODE ACTIVE]` to user messages |
 | `systemPrompt` | string \| null | `null` | Override entire system prompt (null = use defaults + additions) |
 | `systemPromptAdditions` | string | `""` | Append to default system prompt (ignored if systemPrompt is set) |

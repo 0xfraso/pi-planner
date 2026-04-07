@@ -412,7 +412,7 @@ export default function plannerExtension(pi: ExtensionAPI): void {
 	const settings = loadPlannerSettings();
 	setSettings(settings);
 
-	let planModeEnabled = settings.defaultMode === "plan";
+	let planModeEnabled = settings.defaultOn;
 	let previousModel: ModelRef | null = null;
 	let previousThinkingLevel: PlannerThinkingLevel | null = null;
 	let sessionPlanModel: ModelRef | null = null;
@@ -816,7 +816,7 @@ export default function plannerExtension(pi: ExtensionAPI): void {
 		setSettings(settings);
 
 		const restored = getLatestPlanModeState(ctx);
-		planModeEnabled = restored?.active ?? settings.defaultMode === "plan";
+		planModeEnabled = restored?.active ?? settings.defaultOn;
 		previousModel = restored?.previousModel ?? null;
 		previousThinkingLevel = restored?.previousThinkingLevel ?? null;
 		sessionPlanModel = restored?.sessionPlanModel ?? null;
