@@ -663,13 +663,6 @@ export default function plannerExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			if (!planModeEnabled) {
-				return {
-					content: [{ type: "text", text: "Plan mode is off. Ask the user directly in normal conversation instead." }],
-					details: { active: false },
-				};
-			}
-
 			if (!ctx.hasUI) {
 				return {
 					content: [{ type: "text", text: "planner_ask requires interactive mode." }],
