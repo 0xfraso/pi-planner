@@ -23,6 +23,13 @@ const PlannerAskQuestionParams = Type.Object({
 			description: "When true, allow typed free-text input in addition to choices. If options are omitted, a typed answer is required.",
 		}),
 	),
+	maxQuestionLines: Type.Optional(
+		Type.Number({
+			description: "Maximum lines to show for the question text before truncation indicator (default: 5). Set higher for very long questions.",
+			minimum: 1,
+			maximum: 20,
+		}),
+	),
 });
 const PlannerAskParams = Type.Object({
 	questions: Type.Array(PlannerAskQuestionParams, {

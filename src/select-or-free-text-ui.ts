@@ -1,5 +1,5 @@
 import type { ExtensionUIContext } from "@mariozechner/pi-coding-agent";
-import { Editor, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import { Editor, Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 
 export const OTHER_OPTION_LABEL = "Other (type your own)";
 
@@ -18,6 +18,8 @@ export interface SelectOrFreeTextConfig {
 	options?: SelectOrFreeTextOption[];
 	recommended?: number;
 	allowFreeText?: boolean;
+	/** Maximum lines to show for the question text (default: 25) */
+	maxQuestionLines?: number;
 }
 
 function getInitialIndex(recommended: number | undefined, optionCount: number): number {
@@ -37,9 +39,10 @@ export async function askSelectOrFreeText(
 ): Promise<SelectOrFreeTextResult> {
 	const baseOptions = config.options ?? [];
 	const optionLabels = baseOptions.map((option) => option.label);
-	const supportsFreeText = config.allowFreeText === true || optionLabels.length === 0;
+	const supportsFreeText = true; // Always allow free text
+	const maxQuestionLines = config.maxQuestionLines ?? 25;
 
-	if (supportsFreeText && optionLabels.length > 0) {
+	if (optionLabels.length > 0) {
 		optionLabels.push(OTHER_OPTION_LABEL);
 	}
 
@@ -93,7 +96,18 @@ export async function askSelectOrFreeText(
 
 			addLine(theme.fg("accent", "─".repeat(width)));
 			addLine("");
-			addLine(theme.fg("text", truncateToWidth(config.question, width)));
+
+			// Wrap the question text to multiple lines
+			const wrappedQuestion = wrapTextWithAnsi(config.question, width);
+			const questionLines = wrappedQuestion.slice(0, maxQuestionLines);
+			const questionTruncated = wrappedQuestion.length > maxQuestionLines;
+
+			for (const line of questionLines) {
+				addLine(theme.fg("text", line));
+			}
+			if (questionTruncated) {
+				addLine(theme.fg("muted", `… (${wrappedQuestion.length - maxQuestionLines} more lines truncated)`));
+			}
 			addLine("");
 
 			if (!freeTextMode) {

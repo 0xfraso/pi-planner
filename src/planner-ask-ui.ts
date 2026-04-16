@@ -11,6 +11,8 @@ export interface PlannerAskQuestion {
 	options?: PlannerAskOption[];
 	recommended?: number;
 	allowFreeText?: boolean;
+	/** Maximum lines to show for the question text (default: 5) */
+	maxQuestionLines?: number;
 }
 
 export interface PlannerAskAnswer {
@@ -31,6 +33,7 @@ async function askSingleQuestion(
 		options: baseOptions,
 		recommended: question.recommended,
 		allowFreeText: question.allowFreeText,
+		maxQuestionLines: question.maxQuestionLines,
 	});
 
 	if (result.cancelled) {
